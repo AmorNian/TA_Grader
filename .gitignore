@@ -1,6 +1,7 @@
 homeworks/
 homework.xlsx
 homeworks.xlsx
+grade.xlsx
 ~$*.xlsx
 .grader_test/
 *.tmp
