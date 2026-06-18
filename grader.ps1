@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$Assignment = "homework1",
+    [string]$Assignment = "Daily1",
     [int]$Port = 8765,
     [switch]$SelfTest,
     [switch]$NoOpen
@@ -9,7 +9,7 @@ $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $HomeworksDir = Join-Path $Root "homeworks"
-$WorkbookPath = Join-Path $Root "homework.xlsx"
+$WorkbookPath = Join-Path $Root "grade.xlsx"
 if (-not (Test-Path $WorkbookPath)) {
     $alternate = Join-Path $Root "homeworks.xlsx"
     if (Test-Path $alternate) {
@@ -27,22 +27,61 @@ if (-not (Test-Path $WorkbookPath)) {
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
-$script:Submissions = @()
-$script:IdToIndex = @{}
-$folders = Get-ChildItem -Path $HomeworksDir -Directory | Sort-Object Name
-foreach ($folder in $folders) {
-    $id = ($folder.Name -split "_")[0]
-    $pdf = Get-ChildItem -Path $folder.FullName -File -Filter "*.pdf" -Recurse | Sort-Object FullName | Select-Object -First 1
-    $item = [ordered]@{
-        id = $id
-        folder = $folder.Name
-        pdfName = if ($pdf) { $pdf.Name } else { "" }
-        hasPdf = [bool]$pdf
-        pdfPath = if ($pdf) { $pdf.FullName } else { "" }
-    }
-    $script:IdToIndex[$id] = $script:Submissions.Count
-    $script:Submissions += [pscustomobject]$item
+$script:SupportedFileTypes = @(".pdf", ".jpg", ".jpeg", ".png")
+$script:ContentTypes = @{
+    ".pdf" = "application/pdf"
+    ".jpg" = "image/jpeg"
+    ".jpeg" = "image/jpeg"
+    ".png" = "image/png"
 }
+
+function Get-SubmissionFile {
+    param([string]$FolderPath)
+    $files = Get-ChildItem -Path $FolderPath -File -Recurse |
+        Where-Object { $script:SupportedFileTypes -contains $_.Extension.ToLowerInvariant() } |
+        Sort-Object @{ Expression = {
+            $ext = $_.Extension.ToLowerInvariant()
+            $idx = [array]::IndexOf($script:SupportedFileTypes, $ext)
+            if ($idx -lt 0) { 999 } else { $idx }
+        } }, FullName
+
+    return $files | Select-Object -First 1
+}
+
+function Update-Submissions {
+    param([switch]$PreserveOnEmpty)
+
+    $nextSubmissions = @()
+    $nextIdToIndex = @{}
+
+    $folders = Get-ChildItem -Path $HomeworksDir -Directory | Sort-Object Name
+    foreach ($folder in $folders) {
+        $id = ($folder.Name -split "_")[0]
+        $file = Get-SubmissionFile $folder.FullName
+        $item = [ordered]@{
+            id = $id
+            folder = $folder.Name
+            fileName = if ($file) { $file.Name } else { "" }
+            hasFile = [bool]$file
+            filePath = if ($file) { $file.FullName } else { "" }
+            fileType = if ($file) { $file.Extension.TrimStart(".").ToLowerInvariant() } else { "" }
+            pdfName = if ($file) { $file.Name } else { "" }
+            hasPdf = [bool]$file
+            pdfPath = if ($file) { $file.FullName } else { "" }
+        }
+        $nextIdToIndex[$id] = $nextSubmissions.Count
+        $nextSubmissions += [pscustomobject]$item
+    }
+
+    if ($PreserveOnEmpty -and $nextSubmissions.Count -eq 0 -and $script:Submissions.Count -gt 0) {
+        return
+    }
+
+    $script:Submissions = $nextSubmissions
+    $script:IdToIndex = $nextIdToIndex
+}
+
+Update-Submissions
 
 function New-JsonResponse {
     param(
@@ -63,8 +102,14 @@ function Write-Response {
     $reason = if ($StatusCode -eq 200) { "OK" } elseif ($StatusCode -eq 400) { "Bad Request" } elseif ($StatusCode -eq 404) { "Not Found" } else { "Internal Server Error" }
     $header = "HTTP/1.1 $StatusCode $reason`r`nContent-Type: $ContentType`r`nContent-Length: $($bytes.Length)`r`nConnection: close`r`n`r`n"
     $headerBytes = [System.Text.Encoding]::ASCII.GetBytes($header)
-    $Stream.Write($headerBytes, 0, $headerBytes.Length)
-    $Stream.Write($bytes, 0, $bytes.Length)
+    try {
+        $Stream.Write($headerBytes, 0, $headerBytes.Length)
+        $Stream.Write($bytes, 0, $bytes.Length)
+    } catch [System.IO.IOException] {
+        return
+    } catch [System.ObjectDisposedException] {
+        return
+    }
 }
 
 function Write-FileResponse {
@@ -74,14 +119,20 @@ function Write-FileResponse {
         [string]$ContentType
     )
     if (-not (Test-Path $Path)) {
-        Write-Response $Stream (New-JsonResponse @{ ok = $false; error = "PDF not found" }) "application/json; charset=utf-8" 404
+        Write-Response $Stream (New-JsonResponse @{ ok = $false; error = "File not found" }) "application/json; charset=utf-8" 404
         return
     }
     $bytes = [System.IO.File]::ReadAllBytes($Path)
     $header = "HTTP/1.1 200 OK`r`nContent-Type: $ContentType`r`nContent-Length: $($bytes.Length)`r`nConnection: close`r`n`r`n"
     $headerBytes = [System.Text.Encoding]::ASCII.GetBytes($header)
-    $Stream.Write($headerBytes, 0, $headerBytes.Length)
-    $Stream.Write($bytes, 0, $bytes.Length)
+    try {
+        $Stream.Write($headerBytes, 0, $headerBytes.Length)
+        $Stream.Write($bytes, 0, $bytes.Length)
+    } catch [System.IO.IOException] {
+        return
+    } catch [System.ObjectDisposedException] {
+        return
+    }
 }
 
 function ConvertTo-ColName {
@@ -383,6 +434,60 @@ function Find-StudentRow {
     throw "Student id '$StudentId' was not found in workbook."
 }
 
+function Find-HeaderColumnByNames {
+    param(
+        [hashtable]$Ctx,
+        [string[]]$Names
+    )
+    $used = Get-SheetUsedRange $Ctx.sheetDoc $Ctx.ns
+    $maxHeaderRows = [Math]::Min(20, $used.rows)
+    $nameSet = @{}
+    foreach ($name in $Names) {
+        $nameSet[$name.Trim().ToLowerInvariant()] = $true
+    }
+
+    for ($r = 1; $r -le $maxHeaderRows; $r++) {
+        for ($c = 1; $c -le $used.cols; $c++) {
+            $value = (Get-CellText $Ctx.sheetDoc $Ctx.ns $Ctx.sharedStrings $r $c).Trim().ToLowerInvariant()
+            if ($nameSet.ContainsKey($value)) {
+                return @{ row = $r; col = $c }
+            }
+        }
+    }
+    return $null
+}
+
+function Get-StudentInfoMap {
+    $opened = Open-WorkbookZipRead
+    $zip = $opened.zip
+    try {
+        $ctx = Get-SheetContext $zip
+        $used = Get-SheetUsedRange $ctx.sheetDoc $ctx.ns
+        $idHeader = Find-HeaderColumnByNames $ctx @("学籍番号", "student id", "studentid", "id")
+        $nameHeader = Find-HeaderColumnByNames $ctx @("氏名", "name", "名前", "student name", "studentname")
+        if (-not $idHeader -or -not $nameHeader) {
+            return @{}
+        }
+
+        $result = @{}
+        $startRow = [Math]::Max($idHeader.row, $nameHeader.row) + 1
+        for ($r = $startRow; $r -le $used.rows; $r++) {
+            $id = (Get-CellText $ctx.sheetDoc $ctx.ns $ctx.sharedStrings $r $idHeader.col).Trim()
+            if (-not $id) { continue }
+            $name = (Get-CellText $ctx.sheetDoc $ctx.ns $ctx.sharedStrings $r $nameHeader.col).Trim()
+            $result[$id.ToUpperInvariant()] = @{
+                id = $id
+                name = $name
+                row = $r
+            }
+        }
+        return $result
+    } finally {
+        $zip.Dispose()
+        $opened.stream.Dispose()
+    }
+}
+
 function Get-WorkbookInfo {
     $opened = Open-WorkbookZipRead
     $zip = $opened.zip
@@ -517,10 +622,22 @@ function ConvertFrom-QueryString {
 
 if ($SelfTest) {
     $info = Get-WorkbookInfo
+    Update-Submissions
     "Workbook: $($info.workbook)"
     "Sheet: $($info.sheet)"
     "Submissions: $($script:Submissions.Count)"
-    "First submission: $($script:Submissions[0].id) / $($script:Submissions[0].pdfName)"
+    "First submission: $($script:Submissions[0].id) / $($script:Submissions[0].fileName)"
+    $studentInfo = Get-StudentInfoMap
+    $firstKey = $script:Submissions[0].id.Trim().ToUpperInvariant()
+    if ($studentInfo.ContainsKey($firstKey)) {
+        "First student name: $($studentInfo[$firstKey].name)"
+    }
+    try {
+        $graded = Get-GradedMap $Assignment
+        "Graded in '$Assignment': $($graded.Count)"
+    } catch {
+        "Graded in '$Assignment': 0 ($($_.Exception.Message))"
+    }
     "Headers: $($info.headers -join ', ')"
     if ($info.lockedHint) {
         "Warning: Excel lock file exists. Close the workbook in Excel before saving scores."
@@ -559,9 +676,10 @@ $Html = @'
     .row.graded.active { background: #dff7e8; box-shadow: inset 3px 0 #16a34a; }
     .sidline { display: flex; align-items: center; gap: 8px; min-width: 0; }
     .sid { font-weight: 700; display: block; flex: 1; min-width: 0; }
+    .studentname { color: #374151; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .badge { flex: 0 0 auto; border-radius: 999px; padding: 2px 7px; color: #166534; background: #dcfce7; border: 1px solid #86efac; font-size: 12px; line-height: 1.3; }
     .row.active .badge { background: #bbf7d0; }
-    .pdfname { color: #6b7280; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .filename { color: #6b7280; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     main { background: #9ca3af; min-width: 0; }
     iframe { width: 100%; height: 100%; border: 0; background: #52525b; display: block; }
     .panel { background: #ffffff; border-left: 1px solid #d1d5db; padding: 16px; overflow: auto; }
@@ -595,18 +713,19 @@ $Html = @'
     </header>
     <aside>
       <div class="search">
-        <label for="filter">搜索学号</label>
+        <label for="filter">搜索学号或姓名</label>
         <input id="filter" type="text" placeholder="例如 23B10064">
       </div>
       <div id="list" class="list"></div>
     </aside>
     <main>
-      <iframe id="viewer" title="PDF"></iframe>
+      <iframe id="viewer" title="作业文件"></iframe>
     </main>
     <section class="panel">
       <div class="current">
         <h2 id="sid">-</h2>
-        <div id="pdfname" class="muted"></div>
+        <div id="studentname" class="studentname"></div>
+        <div id="filename" class="muted"></div>
         <div id="locked" class="warning">检测到 Excel 临时锁文件。保存失败时，请先关闭 Excel 里的表格。</div>
       </div>
       <label for="score">分数</label>
@@ -642,9 +761,30 @@ $Html = @'
       return data;
     }
 
+    function escapeHtml(value) {
+      return String(value || '').replace(/[&<>"']/g, ch => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;'
+      }[ch]));
+    }
+
+    function chooseAssignment(headers) {
+      const input = el('assignment');
+      const current = input.value.trim();
+      if (!headers || !headers.length) return;
+      const exists = headers.some(h => String(h).trim().toLowerCase() === current.toLowerCase());
+      if (!current || !exists) {
+        input.value = headers[headers.length - 1];
+      }
+    }
+
     async function loadData() {
       setStatus('正在载入...');
       const data = await api('/data');
+      chooseAssignment(data.workbook.headers);
       submissions = data.submissions.map(s => ({...s, graded: false, score: ''}));
       el('locked').style.display = data.workbook.lockedHint ? 'block' : 'none';
       renderList();
@@ -677,13 +817,15 @@ $Html = @'
     function renderList() {
       const q = el('filter').value.trim().toUpperCase();
       filtered = submissions.map((s, i) => ({...s, realIndex: i}))
-        .filter(s => !q || s.id.toUpperCase().includes(q));
+        .filter(s => !q || s.id.toUpperCase().includes(q) || String(s.studentName || s.name || '').toUpperCase().includes(q));
       el('list').innerHTML = '';
       filtered.forEach((s, i) => {
         const btn = document.createElement('button');
         btn.className = 'row' + (s.graded ? ' graded' : '') + (s.realIndex === index ? ' active' : '');
         const badge = s.graded ? `<span class="badge">已评分 ${s.score}</span>` : '';
-        btn.innerHTML = `<span class="sidline"><span class="sid">${s.id}</span>${badge}</span><span class="pdfname">${s.pdfName || '未找到 PDF'}</span>`;
+        const name = s.studentName || s.name || '';
+        const nameLine = name ? `<span class="studentname">${escapeHtml(name)}</span>` : '';
+        btn.innerHTML = `<span class="sidline"><span class="sid">${escapeHtml(s.id)}</span>${badge}</span>${nameLine}<span class="filename">${escapeHtml(s.fileName || '未找到作业文件')}</span>`;
         btn.onclick = () => selectByRealIndex(s.realIndex);
         el('list').appendChild(btn);
       });
@@ -700,8 +842,9 @@ $Html = @'
       index = Math.max(0, Math.min(submissions.length - 1, i));
       const s = submissions[index];
       el('sid').textContent = s.id;
-      el('pdfname').textContent = s.pdfName || s.folder;
-      el('viewer').src = s.hasPdf ? `/pdf?i=${index}` : 'about:blank';
+      el('studentname').textContent = s.studentName || s.name || '';
+      el('filename').textContent = s.fileName || s.folder;
+      el('viewer').src = s.hasFile ? `/file?i=${index}` : 'about:blank';
       el('score').value = '';
       renderList();
       await loadScore();
@@ -800,6 +943,7 @@ try {
 
 Write-Host "Homework grader is running at $prefix"
 Write-Host "Workbook: $WorkbookPath"
+Write-Host "Submissions: $($script:Submissions.Count)"
 Write-Host "Press Ctrl+C in this window to stop."
 if (-not $NoOpen) {
     Start-Process $prefix
@@ -841,27 +985,53 @@ while ($running) {
         }
 
         $uri = [System.Uri]::new("http://127.0.0.1$target")
-        $path = $uri.AbsolutePath
+        $requestPath = $uri.AbsolutePath
         $query = ConvertFrom-QueryString $uri.Query
 
-        if ($path -eq "/") {
+        if ($requestPath -eq "/") {
             Write-Response $stream $Html "text/html; charset=utf-8"
-        } elseif ($path -eq "/data") {
+        } elseif ($requestPath -eq "/data") {
+            Update-Submissions -PreserveOnEmpty
             $info = Get-WorkbookInfo
-            Write-Response $stream (New-JsonResponse @{ ok = $true; submissions = $script:Submissions; workbook = $info })
-        } elseif ($path -eq "/pdf") {
+            $studentInfo = Get-StudentInfoMap
+            $responseSubmissions = @()
+            foreach ($submission in $script:Submissions) {
+                $key = $submission.id.Trim().ToUpperInvariant()
+                $meta = if ($studentInfo.ContainsKey($key)) { $studentInfo[$key] } else { $null }
+                $responseSubmissions += [pscustomobject][ordered]@{
+                    id = $submission.id
+                    name = if ($meta) { $meta.name } else { "" }
+                    studentName = if ($meta) { $meta.name } else { "" }
+                    row = if ($meta) { $meta.row } else { $null }
+                    folder = $submission.folder
+                    fileName = $submission.fileName
+                    hasFile = $submission.hasFile
+                    fileType = $submission.fileType
+                    pdfName = $submission.pdfName
+                    hasPdf = $submission.hasPdf
+                }
+            }
+            Write-Response $stream (New-JsonResponse @{ ok = $true; submissions = $responseSubmissions; workbook = $info })
+        } elseif ($requestPath -eq "/file" -or $requestPath -eq "/pdf") {
             $i = [int]$query["i"]
             if ($i -lt 0 -or $i -ge $script:Submissions.Count) {
-                Write-Response $stream (New-JsonResponse @{ ok = $false; error = "Bad PDF index" }) "application/json; charset=utf-8" 400
+                Write-Response $stream (New-JsonResponse @{ ok = $false; error = "Bad file index" }) "application/json; charset=utf-8" 400
             } else {
-                Write-FileResponse $stream $script:Submissions[$i].pdfPath "application/pdf"
+                $submission = $script:Submissions[$i]
+                if (-not $submission.hasFile) {
+                    Write-Response $stream (New-JsonResponse @{ ok = $false; error = "No submission file" }) "application/json; charset=utf-8" 404
+                } else {
+                    $ext = [System.IO.Path]::GetExtension($submission.filePath).ToLowerInvariant()
+                    $contentType = if ($script:ContentTypes.ContainsKey($ext)) { $script:ContentTypes[$ext] } else { "application/octet-stream" }
+                    Write-FileResponse $stream $submission.filePath $contentType
+                }
             }
-        } elseif ($path -eq "/score") {
+        } elseif ($requestPath -eq "/score") {
             $id = [string]$query["id"]
             $header = [string]$query["assignment"]
             $score = Get-Score $id $header
             Write-Response $stream (New-JsonResponse (@{ ok = $true } + $score))
-        } elseif ($path -eq "/grades") {
+        } elseif ($requestPath -eq "/grades") {
             $header = [string]$query["assignment"]
             try {
                 $grades = Get-GradedMap $header
@@ -869,7 +1039,7 @@ while ($running) {
                 $grades = @{}
             }
             Write-Response $stream (New-JsonResponse @{ ok = $true; grades = $grades })
-        } elseif ($path -eq "/save" -and $method -eq "POST") {
+        } elseif ($requestPath -eq "/save" -and $method -eq "POST") {
             $payload = $body | ConvertFrom-Json
             $result = Save-Score ([string]$payload.id) ([string]$payload.assignment) ([string]$payload.score) ([bool]$payload.createColumn)
             Write-Response $stream (New-JsonResponse (@{ ok = $true } + $result))
